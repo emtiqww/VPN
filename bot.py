@@ -182,7 +182,10 @@ class MarzbanAPI:
 
         headers = {'Authorization': f'Bearer {token}'}
         expire = int((datetime.now() + timedelta(days=days)).timestamp())
-        username = f"user_{user_id}"
+        
+        # ✅ УНИКАЛЬНОЕ ИМЯ: user_{user_id}_{days}_{timestamp}
+        timestamp = int(datetime.now().timestamp())
+        username = f"user_{user_id}_{days}_{timestamp}"
 
         user_data = {
             'username': username,
@@ -264,26 +267,69 @@ def deduct_user_balance(user_id, amount):
     conn.close()
     return True
 
+# ================ ФУНКЦИИ ПЛАТЕЖЕЙ ================
+def add_payment(user_id, amount, currency, payment_id, tariff, status='pending'):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO payments (user_id, amount, currency, payment_id, tariff, status)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (user_id, amount, currency, str(payment_id), tariff, status))
+    conn.commit()
+    return cur.lastrowid
+
+def complete_payment(payment_id):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('''
+        UPDATE payments
+        SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+        WHERE payment_id = ? AND status = 'pending'
+    ''', (str(payment_id),))
+    affected = cur.rowcount
+    conn.commit()
+    conn.close()
+    return affected > 0
+
+def verify_payment(payment_id):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT status FROM payments WHERE payment_id = ?', (str(payment_id),))
+    row = cur.fetchone()
+    conn.close()
+    if row and row['status'] == 'completed':
+        return False
+    return True
+
 # ================ ФУНКЦИИ VPN ================
 def create_vpn_subscription(user_id, days):
     marzban_username, subscription_url = marzban.create_user(user_id, days)
     if not subscription_url:
         logger.error(f"❌ Не удалось создать VPN для user {user_id}")
         return None
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute('''
-        INSERT INTO subscriptions (user_id, marzban_username, subscription_url, country, expires_at)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (
-        user_id,
-        marzban_username,
-        subscription_url,
-        'de',
-        (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
-    ))
-    conn.commit()
-    conn.close()
+    
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        # INSERT OR REPLACE — если запись уже есть (но username теперь уникальный, конфликта не будет)
+        cur.execute('''
+            INSERT OR REPLACE INTO subscriptions 
+            (user_id, marzban_username, subscription_url, country, expires_at, status)
+            VALUES (?, ?, ?, ?, ?, 'active')
+        ''', (
+            user_id,
+            marzban_username,
+            subscription_url,
+            'de',
+            (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+        ))
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ Подписка сохранена/обновлена в БД для user {user_id}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения подписки в БД: {e}")
+        return None
+    
     return {
         'username': marzban_username,
         'subscription_url': subscription_url,
@@ -469,6 +515,7 @@ def callback_handler(call):
                         f"Инструкция по подключению — смотрите в меню /help."
                     )
                     bot.send_message(user_id, text_fallback)
+                    logger.info(f"✅ Fallback-сообщение отправлено пользователю {user_id}")
             else:
                 update_user_balance(user_id, tariff['price_rub'])
                 bot.send_message(user_id, "❌ Ошибка создания VPN. Деньги возвращены на баланс.")
