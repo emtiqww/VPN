@@ -135,6 +135,7 @@ def marzban_auth():
 def create_vpn_for_user(user_id, days):
     token = marzban_auth()
     if not token:
+        bot.send_message(user_id, "❌ Ошибка подключения к VPN-серверу. Администратор уже уведомлён.")
         return False
     
     headers = {'Authorization': f'Bearer {token}'}
@@ -228,10 +229,76 @@ def create_vpn_for_user(user_id, days):
         conn.close()
     return False
 
+# ========== КОМАНДЫ TELEGRAM ==========
 @bot.message_handler(commands=['start'])
 def start(message):
-    print(f"🔥🔥🔥 /start от {message.from_user.id}")
-    bot.send_message(message.chat.id, "✅ Бот работает!")
+    user_id = message.from_user.id
+    username = message.from_user.username
+    
+    logger.info(f"🔥 /start from user {user_id} (@{username})")
+    
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)', (user_id, username))
+    conn.commit()
+    conn.close()
+    
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton('🛒 Купить подписку', callback_data='buy'))
+    bot.send_message(
+        user_id,
+        '👋 Добро пожаловать в WhitePrism VPN!\n\n'
+        '🚀 Быстрый и стабильный VPN на базе VLESS\n'
+        '🌍 Сервера в Нидерландах\n'
+        '📱 Поддержка всех устройств\n\n'
+        '👇 Нажми кнопку ниже, чтобы выбрать тариф',
+        reply_markup=markup
+    )
+
+@bot.message_handler(commands=['help'])
+def help_command(message):
+    bot.send_message(
+        message.chat.id,
+        '🆘 Помощь\n\n'
+        '/start - Начать работу\n'
+        '/help - Показать эту справку\n'
+        '/balance - Проверить баланс\n'
+        '/my_subscriptions - Мои подписки'
+    )
+
+@bot.message_handler(commands=['balance'])
+def balance(message):
+    user_id = message.from_user.id
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT balance FROM users WHERE user_id = ?', (user_id,))
+    row = cur.fetchone()
+    balance = row['balance'] if row else 0
+    conn.close()
+    bot.send_message(user_id, f"💰 Ваш баланс: {balance} ₽")
+
+@bot.message_handler(commands=['my_subscriptions'])
+def my_subscriptions(message):
+    user_id = message.from_user.id
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('''
+        SELECT * FROM subscriptions 
+        WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now')
+    ''', (user_id,))
+    subs = cur.fetchall()
+    conn.close()
+    
+    if not subs:
+        bot.send_message(user_id, "❌ У вас нет активных подписок")
+        return
+    
+    text = "📋 Ваши подписки:\n\n"
+    for sub in subs:
+        text += f"🔗 Конфиг: {sub['config_link'][:50]}...\n"
+        text += f"📅 Действует до: {sub['expires_at']}\n\n"
+    
+    bot.send_message(user_id, text)
 
 @bot.callback_query_handler(func=lambda call: call.data == 'buy')
 def buy_callback(call):
@@ -358,7 +425,7 @@ def crypto_webhook():
             conn.commit()
             
             bot.send_message(user_id, "⏳ Создаём ваш VPN-ключ...")
-            create_vpn_for_user(user_id, 30)  # По умолчанию 30 дней
+            create_vpn_for_user(user_id, 30)
         
         conn.close()
     
@@ -427,7 +494,7 @@ def broadcast(message):
     
     bot.reply_to(message, f"✅ Рассылка отправлена {sent} пользователям")
 
-# ========== WEBHOOK ==========
+# ========== WEBHOOK FLASK ==========
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
