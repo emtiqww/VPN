@@ -2,7 +2,6 @@ import os
 import sys
 import logging
 import sqlite3
-import math
 import json
 from datetime import datetime, timedelta
 from functools import wraps
@@ -13,7 +12,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 import requests
 
-# ================ НАСТРОЙКА ЛОГИРОВАНИЯ ===========
+# ================ НАСТРОЙКА ЛОГИРОВАНИЯ ================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -43,32 +42,37 @@ MARZBAN_URL = os.getenv('MARZBAN_URL', 'http://localhost:8443')
 MARZBAN_USER = os.getenv('MARZBAN_USER', 'admin')
 MARZBAN_PASS = os.getenv('MARZBAN_PASS', '')
 
+# ================ ВНЕШНИЙ URL ПАНЕЛИ MARZBAN ================
+MARZBAN_EXTERNAL_URL = os.getenv('MARZBAN_EXTERNAL_URL', '')
+if not MARZBAN_EXTERNAL_URL:
+    logger.warning("⚠️ MARZBAN_EXTERNAL_URL не задан, subscription_url может быть недоступен извне!")
+
 # ================ CRYPTOBOT ================
 CRYPTOBOT_TOKEN = os.getenv('CRYPTOBOT_TOKEN', '')
 
 # ================ КОНСТАНТЫ ================
-USDT_PRICE_RUB = 90  # фиксированный курс для CryptoBot
+USDT_PRICE_RUB = 90
 
-# ФИКСИРОВАННЫЕ ЦЕНЫ В ЗВЁЗДАХ (БЕЗ РАСЧЁТОВ)
+# ФИКСИРОВАННЫЕ ЦЕНЫ В ЗВЁЗДАХ
 TARIFFS = {
     'month': {
         'name': '1 месяц',
         'price_rub': 199,
-        'price_stars': 120,   # ✅ ровно 120
+        'price_stars': 120,
         'days': 30,
         'popular': True
     },
     'quarter': {
         'name': '3 месяца',
         'price_rub': 499,
-        'price_stars': 300,   # ✅ ровно 300
+        'price_stars': 300,
         'days': 90,
         'popular': False
     },
     'year': {
         'name': '1 год',
         'price_rub': 1499,
-        'price_stars': 900,   # ✅ ровно 900
+        'price_stars': 900,
         'days': 365,
         'popular': False
     }
@@ -129,7 +133,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             marzban_username TEXT UNIQUE,
-            config_link TEXT,
+            subscription_url TEXT,
             country TEXT DEFAULT 'de',
             expires_at TIMESTAMP,
             status TEXT DEFAULT 'active',
@@ -177,12 +181,12 @@ class MarzbanAPI:
         token = self._auth()
         if not token:
             logger.error("❌ Не удалось получить токен Marzban")
-            return None
+            return None, None
 
         headers = {'Authorization': f'Bearer {token}'}
         expire = int((datetime.now() + timedelta(days=days)).timestamp())
         
-        # ✅ Имя пользователя = только user_id (без timestamp)
+        # Имя пользователя = только user_id
         username = f"user_{user_id}"
 
         user_data = {
@@ -196,7 +200,7 @@ class MarzbanAPI:
             'status': 'active'
         }
 
-        logger.info(f"📤 Отправка запроса в Marzban: {json.dumps(user_data, indent=2)}")
+        logger.info(f"📤 Отправка запроса в Marzban: {json.dumps(user_data)}")
         
         try:
             resp = requests.post(
@@ -211,12 +215,23 @@ class MarzbanAPI:
             
             if resp.status_code == 200:
                 data = resp.json()
-                links = data.get('links', [])
-                if links:
-                    logger.info(f"✅ Получена ссылка: {links[0]}")
-                    return username, links[0]  # возвращаем имя и ссылку
+                
+                # ✅ БЕРЁМ ССЫЛКУ НА ПОДПИСКУ
+                sub_url = data.get('subscription_url', '')
+                if sub_url:
+                    # Если ссылка относительная — делаем абсолютной
+                    if sub_url.startswith('/'):
+                        if MARZBAN_EXTERNAL_URL:
+                            sub_url = MARZBAN_EXTERNAL_URL.rstrip('/') + sub_url
+                        else:
+                            # fallback — но это будет localhost, не сработает
+                            sub_url = self.base_url + sub_url
+                            logger.warning("⚠️ MARZBAN_EXTERNAL_URL не задан, subscription_url может быть недоступен!")
+                    
+                    logger.info(f"✅ Получена подписка: {sub_url}")
+                    return username, sub_url
                 else:
-                    logger.error("❌ В ответе нет links")
+                    logger.error("❌ В ответе нет subscription_url")
                     return None, None
             else:
                 logger.error(f"❌ Ошибка Marzban: {resp.status_code} - {resp.text}")
@@ -304,20 +319,20 @@ def verify_payment(payment_id):
 
 # ================ ФУНКЦИИ VPN ================
 def create_vpn_subscription(user_id, days):
-    marzban_username, config_link = marzban.create_user(user_id, days)
-    if not config_link:
+    marzban_username, subscription_url = marzban.create_user(user_id, days)
+    if not subscription_url:
         logger.error(f"❌ Не удалось создать VPN для user {user_id}")
         return None
     
     conn = get_db()
     cur = conn.cursor()
     cur.execute('''
-        INSERT INTO subscriptions (user_id, marzban_username, config_link, country, expires_at)
+        INSERT INTO subscriptions (user_id, marzban_username, subscription_url, country, expires_at)
         VALUES (?, ?, ?, ?, ?)
     ''', (
         user_id,
         marzban_username,
-        config_link,
+        subscription_url,
         'de',
         (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
     ))
@@ -326,7 +341,7 @@ def create_vpn_subscription(user_id, days):
     
     return {
         'username': marzban_username,
-        'config_link': config_link,
+        'subscription_url': subscription_url,
         'expires_at': datetime.now() + timedelta(days=days),
         'country': SERVER_COUNTRY['name']
     }
@@ -438,7 +453,7 @@ def cmd_my_subs(message):
     for sub in subs:
         text += f"🌍 {SERVER_COUNTRY['name']}\n"
         text += f"📅 Действует до: {sub['expires_at'][:10]}\n"
-        text += f"🔗 [Скачать конфиг]({sub['config_link']})\n\n"
+        text += f"🔗 [Ссылка на подписку]({sub['subscription_url']})\n\n"
     bot.send_message(user_id, text, parse_mode='Markdown', disable_web_page_preview=True)
 
 # ================ CALLBACKS ================
@@ -470,36 +485,46 @@ def callback_handler(call):
             return
         balance = get_user_balance(user_id)
         
-        # Проверка баланса
         if balance >= tariff['price_rub']:
             bot.answer_callback_query(call.id, "✅ Оплачено с баланса")
             if not deduct_user_balance(user_id, tariff['price_rub']):
                 bot.answer_callback_query(call.id, "❌ Ошибка списания", show_alert=True)
                 return
             bot.edit_message_text(
-                "⏳ **Создаём VPN-ключ...**\nЭто займёт несколько секунд.",
+                "⏳ **Создаём VPN-подписку...**\nЭто займёт несколько секунд.",
                 user_id, call.message.message_id, parse_mode='Markdown'
             )
             subscription = create_vpn_subscription(user_id, tariff['days'])
             if subscription:
+                # Основное сообщение с подпиской
                 text = (
-                    f"✅ **VPN активирован!**\n\n"
+                    f"✅ **VPN подписка активирована!**\n\n"
                     f"📅 Действует до: {subscription['expires_at'].strftime('%d.%m.%Y')}\n"
                     f"🌍 Страна: {subscription['country']}\n\n"
-                    f"🔗 **Ссылка для подключения:**\n"
-                    f"`{subscription['config_link']}`"
+                    f"🔗 **Ссылка на подписку:**\n"
+                    f"`{subscription['subscription_url']}`\n\n"
+                    f"➖➖➖➖➖➖➖➖➖➖➖➖➖\n"
+                    f"📱 **Как подключиться:**\n\n"
+                    f"1️⃣ Скачай приложение:\n"
+                    f"   • Android: [v2rayNG](https://play.google.com/store/apps/details?id=com.v2ray.ang)\n"
+                    f"   • iOS: [Streisand](https://apps.apple.com/app/streisand/id6450534064)\n"
+                    f"   • Windows: [Nekoray](https://github.com/MatsuriDayo/nekoray/releases)\n"
+                    f"   • macOS: [V2RayX](https://github.com/Cenmrev/V2RayX/releases)\n\n"
+                    f"2️⃣ В приложении выбери **«Добавить подписку»** или **«URL подписки»**\n"
+                    f"3️⃣ Вставь ссылку из сообщения выше\n"
+                    f"4️⃣ Нажми подключение — всё! 🔥"
                 )
-                bot.send_message(user_id, text, parse_mode='Markdown')
+                bot.send_message(user_id, text, parse_mode='Markdown', disable_web_page_preview=True)
             else:
                 # Ошибка создания VPN — возвращаем деньги
                 update_user_balance(user_id, tariff['price_rub'])
                 bot.send_message(user_id, "❌ Ошибка создания VPN. Деньги возвращены на баланс.")
             return
         
-        # Не хватает баланса — показываем варианты оплаты
+        # Не хватает баланса
         markup = InlineKeyboardMarkup(row_width=1)
         markup.add(InlineKeyboardButton(
-            f"⭐️ Пополнить {tariff['price_stars']} Stars",  # ✅ фиксированная цена
+            f"⭐️ Пополнить {tariff['price_stars']} Stars",
             callback_data=f"pay_stars_{tariff_key}"
         ))
         if CRYPTOBOT_TOKEN:
@@ -524,11 +549,11 @@ def callback_handler(call):
         if not tariff:
             return
         try:
-            stars = tariff['price_stars']  # ✅ берём фиксированное значение
+            stars = tariff['price_stars']
             prices = [telebot.types.LabeledPrice(label=tariff['name'], amount=stars * 100)]
             bot.send_invoice(
                 user_id,
-                title=f'MER VPN — {tariff["name"]}',  # ✅ название MER
+                title=f'MER VPN — {tariff["name"]}',
                 description=f'Подписка на {tariff["days"]} дней',
                 invoice_payload=f'stars_{tariff_key}_{user_id}',
                 provider_token='',
@@ -599,7 +624,7 @@ def callback_handler(call):
         for sub in subs:
             text += f"🌍 {SERVER_COUNTRY['name']}\n"
             text += f"📅 До: {sub['expires_at'][:10]}\n"
-            text += f"🔗 [Конфиг]({sub['config_link']})\n\n"
+            text += f"🔗 [Ссылка на подписку]({sub['subscription_url']})\n\n"
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("◀️ Назад", callback_data="start"))
         bot.edit_message_text(text, user_id, call.message.message_id, parse_mode='Markdown', reply_markup=markup, disable_web_page_preview=True)
@@ -608,8 +633,9 @@ def callback_handler(call):
         help_text = (
             "📚 **Помощь**\n\n"
             "1. Пополни баланс или оплати тариф звёздами/USDT.\n"
-            "2. После оплаты VPN-ключ придёт автоматически.\n"
-            "3. Используй приложения v2rayNG (Android) или Streisand (iOS).\n\n"
+            "2. После оплаты ты получишь ссылку на подписку.\n"
+            "3. Вставь эту ссылку в приложение (v2rayNG, Streisand, Nekoray) как URL подписки.\n"
+            "4. Подключение произойдёт автоматически!\n\n"
             "❓ Вопросы: @admin"
         )
         bot.edit_message_text(help_text, user_id, call.message.message_id, parse_mode='Markdown')
@@ -646,10 +672,8 @@ def successful_payment_handler(message):
         return
     
     stars_amount = payment.total_amount // 100
-    # Проверяем, что оплачено верное количество звёзд
     if stars_amount != tariff['price_stars']:
         logger.warning(f"⚠️ Неверная сумма звёзд: {stars_amount} вместо {tariff['price_stars']}")
-        # Всё равно начисляем, но логируем
     
     rub_amount = tariff['price_rub']
     add_payment(user_id, rub_amount, 'XTR', payment.telegram_payment_charge_id, tariff_key, 'completed')
