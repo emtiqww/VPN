@@ -47,7 +47,7 @@ MARZBAN_PASS = os.getenv('MARZBAN_PASS', '')
 CRYPTOBOT_TOKEN = os.getenv('CRYPTOBOT_TOKEN', '')
 
 # ================ КОНСТАНТЫ ================
-STAR_PRICE_RUB = 1.65  # Только для информации
+STAR_PRICE_RUB = 1.65
 USDT_PRICE_RUB = 90
 
 # ФИКСИРОВАННЫЕ ЦЕНЫ В ЗВЁЗДАХ
@@ -75,12 +75,16 @@ TARIFFS = {
     }
 }
 
-# ТОЛЬКО ГЕРМАНИЯ (ФРАНКФУРТ)
+# ТОЛЬКО ГЕРМАНИЯ
 SERVER_COUNTRY = {
     'code': 'de',
     'name': '🇩🇪 Германия (Франкфурт)',
     'flag': '🇩🇪'
 }
+
+# ⚠️ ВАЖНО: УКАЖИ ТОЧНЫЙ ТЭГ ТВОЕГО VLESS INBOUND ИЗ XRAY_CONFIG.JSON
+# Посмотреть: grep -o '"tag": "[^"]*"' /var/lib/marzban/xray_config.json | grep VLESS
+VLESS_INBOUND_TAG = "VLESS TCP"   # <--- ЗАМЕНИ НА СВОЙ, ЕСЛИ ОТЛИЧАЕТСЯ
 
 # ================ FLASK ================
 app = Flask(__name__)
@@ -94,7 +98,6 @@ def get_db():
         db_path = '/tmp/whiteprism.db'
     else:
         db_path = 'whiteprism.db'
-    
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
@@ -102,7 +105,6 @@ def get_db():
 def init_db():
     conn = get_db()
     cur = conn.cursor()
-    
     cur.executescript('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -113,7 +115,6 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_activity TIMESTAMP
         );
-        
         CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -126,7 +127,6 @@ def init_db():
             completed_at TIMESTAMP,
             FOREIGN KEY(user_id) REFERENCES users(user_id)
         );
-        
         CREATE TABLE IF NOT EXISTS subscriptions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -139,7 +139,6 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(user_id)
         );
     ''')
-    
     conn.commit()
     conn.close()
     logger.info("✅ База данных инициализирована")
@@ -154,49 +153,45 @@ class MarzbanAPI:
         self.password = password
         self.token = None
         self.token_expiry = None
-    
+
     def _auth(self):
         if self.token and self.token_expiry and datetime.now() < self.token_expiry:
             return self.token
-        
         try:
+            # ВАЖНО: form-data, не json!
             resp = requests.post(
                 f'{self.base_url}/api/admin/token',
                 data={'username': self.username, 'password': self.password},
                 timeout=10
             )
-            
             if resp.status_code == 200:
                 data = resp.json()
                 self.token = data['access_token']
                 self.token_expiry = datetime.now() + timedelta(hours=1)
                 return self.token
             else:
-                logger.error(f"Marzban auth failed: {resp.status_code}")
+                logger.error(f"Marzban auth failed: {resp.status_code} - {resp.text}")
                 return None
         except Exception as e:
             logger.error(f"Marzban connection error: {e}")
             return None
-    
+
     def create_user(self, username, days):
         token = self._auth()
         if not token:
             return None
-        
         headers = {'Authorization': f'Bearer {token}'}
         expire = int((datetime.now() + timedelta(days=days)).timestamp())
-        
         user_data = {
             'username': username,
             'proxies': {'vless': {}},
             'inbounds': {
-                'vless': ['VLESS TCP']   # ⚠️ ЗАМЕНИ НА СВОЙ TAG ИЗ ПУНКТА 2
+                'vless': [VLESS_INBOUND_TAG]   # <-- ТЭГ ИЗ ПЕРЕМЕННОЙ
             },
             'expire': expire,
             'data_limit': 0,
             'status': 'active'
         }
-        
         try:
             resp = requests.post(
                 f'{self.base_url}/api/user',
@@ -204,57 +199,20 @@ class MarzbanAPI:
                 json=user_data,
                 timeout=10
             )
-            
+            logger.info(f"📦 Marzban create user status: {resp.status_code}")
+            logger.info(f"📦 Marzban create user response: {resp.text}")
             if resp.status_code == 200:
                 config_resp = requests.get(
                     f'{self.base_url}/api/user/{username}/config',
                     headers=headers,
                     timeout=10
                 )
-                
                 if config_resp.status_code == 200:
                     return config_resp.json().get('link', '')
             return None
         except Exception as e:
             logger.error(f"Marzban create user error: {e}")
             return None
-    
-    def extend_user(self, username, days):
-        token = self._auth()
-        if not token:
-            return False
-        
-        headers = {'Authorization': f'Bearer {token}'}
-        
-        try:
-            resp = requests.get(
-                f'{self.base_url}/api/user/{username}',
-                headers=headers,
-                timeout=10
-            )
-            
-            if resp.status_code == 200:
-                user_data = resp.json()
-                current_expire = user_data.get('expire', 0)
-                
-                if current_expire:
-                    new_expire = max(current_expire, int(datetime.now().timestamp()))
-                    new_expire = int(new_expire) + (days * 86400)
-                else:
-                    new_expire = int((datetime.now() + timedelta(days=days)).timestamp())
-                
-                update_resp = requests.put(
-                    f'{self.base_url}/api/user/{username}',
-                    headers=headers,
-                    json={'expire': new_expire},
-                    timeout=10
-                )
-                
-                return update_resp.status_code == 200
-            return False
-        except Exception as e:
-            logger.error(f"Marzban extend user error: {e}")
-            return False
 
 marzban = MarzbanAPI(MARZBAN_URL, MARZBAN_USER, MARZBAN_PASS)
 
@@ -271,9 +229,9 @@ def update_user_balance(user_id, amount):
     conn = get_db()
     cur = conn.cursor()
     cur.execute('''
-        INSERT INTO users (user_id, balance, last_activity) 
+        INSERT INTO users (user_id, balance, last_activity)
         VALUES (?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(user_id) DO UPDATE SET 
+        ON CONFLICT(user_id) DO UPDATE SET
         balance = balance + ?,
         last_activity = CURRENT_TIMESTAMP
     ''', (user_id, amount, amount))
@@ -285,11 +243,9 @@ def deduct_user_balance(user_id, amount):
     cur = conn.cursor()
     cur.execute('SELECT balance FROM users WHERE user_id = ?', (user_id,))
     row = cur.fetchone()
-    
     if not row or row['balance'] < amount:
         conn.close()
         return False
-    
     cur.execute('UPDATE users SET balance = balance - ? WHERE user_id = ?', (amount, user_id))
     conn.commit()
     conn.close()
@@ -304,16 +260,14 @@ def add_payment(user_id, amount, currency, payment_id, tariff, status='pending')
         VALUES (?, ?, ?, ?, ?, ?)
     ''', (user_id, amount, currency, str(payment_id), tariff, status))
     conn.commit()
-    payment_db_id = cur.lastrowid
-    conn.close()
-    return payment_db_id
+    return cur.lastrowid
 
 def complete_payment(payment_id):
     conn = get_db()
     cur = conn.cursor()
     cur.execute('''
-        UPDATE payments 
-        SET status = 'completed', completed_at = CURRENT_TIMESTAMP 
+        UPDATE payments
+        SET status = 'completed', completed_at = CURRENT_TIMESTAMP
         WHERE payment_id = ? AND status = 'pending'
     ''', (str(payment_id),))
     affected = cur.rowcount
@@ -322,13 +276,11 @@ def complete_payment(payment_id):
     return affected > 0
 
 def verify_payment(payment_id):
-    """Проверяет, не был ли платёж уже использован"""
     conn = get_db()
     cur = conn.cursor()
     cur.execute('SELECT status FROM payments WHERE payment_id = ?', (str(payment_id),))
     row = cur.fetchone()
     conn.close()
-    
     if row and row['status'] == 'completed':
         return False
     return True
@@ -337,13 +289,11 @@ def verify_payment(payment_id):
 def create_vpn_subscription(user_id, days):
     username = f"user_{user_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
     config_link = marzban.create_user(username, days)
-    
     if not config_link:
+        logger.error(f"❌ Не удалось создать VPN для user {user_id}")
         return None
-    
     conn = get_db()
     cur = conn.cursor()
-    
     cur.execute('''
         INSERT INTO subscriptions (user_id, marzban_username, config_link, country, expires_at)
         VALUES (?, ?, ?, ?, ?)
@@ -351,13 +301,11 @@ def create_vpn_subscription(user_id, days):
         user_id,
         username,
         config_link,
-        'de',  # Всегда Германия
+        'de',
         (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
     ))
-    
     conn.commit()
     conn.close()
-    
     return {
         'username': username,
         'config_link': config_link,
@@ -369,7 +317,7 @@ def get_user_subscriptions(user_id):
     conn = get_db()
     cur = conn.cursor()
     cur.execute('''
-        SELECT * FROM subscriptions 
+        SELECT * FROM subscriptions
         WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now')
         ORDER BY expires_at DESC
     ''', (user_id,))
@@ -404,23 +352,17 @@ def cmd_start(message):
     user_id = message.from_user.id
     username = message.from_user.username
     first_name = message.from_user.first_name
-    
     logger.info(f"🚀 /start от {user_id}")
-    
     conn = get_db()
     cur = conn.cursor()
     cur.execute('''
         INSERT OR IGNORE INTO users (user_id, username, first_name, last_activity)
         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
     ''', (user_id, username, first_name))
-    cur.execute('''
-        UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?
-    ''', (user_id,))
+    cur.execute('UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?', (user_id,))
     conn.commit()
     conn.close()
-    
     balance = get_user_balance(user_id)
-    
     welcome_text = (
         f"👋 Привет, {first_name or 'друг'}!\n\n"
         f"🚀 **MER VPN** — быстрый и стабильный VPN\n"
@@ -428,7 +370,6 @@ def cmd_start(message):
         f"💰 **Твой баланс:** `{balance} ₽`\n\n"
         f"👇 Выбери действие:"
     )
-    
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
         InlineKeyboardButton("🛒 Купить подписку", callback_data="buy"),
@@ -438,13 +379,7 @@ def cmd_start(message):
         InlineKeyboardButton("📱 Мои подписки", callback_data="my_subs"),
         InlineKeyboardButton("ℹ️ Помощь", callback_data="help")
     )
-    
-    bot.send_message(
-        user_id,
-        welcome_text,
-        parse_mode='Markdown',
-        reply_markup=markup
-    )
+    bot.send_message(user_id, welcome_text, parse_mode='Markdown', reply_markup=markup)
 
 @bot.message_handler(commands=['help'])
 def cmd_help(message):
@@ -461,33 +396,26 @@ def cmd_help(message):
 def cmd_balance(message):
     user_id = message.from_user.id
     balance = get_user_balance(user_id)
-    
     text = f"💰 **Твой баланс:** `{balance} ₽`"
-    
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🛒 Купить подписку", callback_data="buy"))
-    
     bot.send_message(user_id, text, parse_mode='Markdown', reply_markup=markup)
 
 @bot.message_handler(commands=['my_subs'])
 def cmd_my_subs(message):
     user_id = message.from_user.id
     subs = get_user_subscriptions(user_id)
-    
     if not subs:
         text = "❌ У тебя нет активных подписок"
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("🛒 Купить подписку", callback_data="buy"))
         bot.send_message(user_id, text, reply_markup=markup)
         return
-    
     text = "📋 **Твои подписки:**\n\n"
-    
     for sub in subs:
         text += f"🌍 {SERVER_COUNTRY['name']}\n"
         text += f"📅 Действует до: {sub['expires_at'][:10]}\n"
         text += f"🔗 [Скачать конфиг]({sub['config_link']})\n\n"
-    
     bot.send_message(user_id, text, parse_mode='Markdown', disable_web_page_preview=True)
 
 # ================ CALLBACKS ================
@@ -495,67 +423,39 @@ def cmd_my_subs(message):
 def callback_handler(call):
     user_id = call.from_user.id
     data = call.data
-    
     logger.info(f"🔄 Callback: {data} от {user_id}")
-    
+
     if data == "buy":
         balance = get_user_balance(user_id)
-        
-        text = (
-            f"📦 **Выбери тариф:**\n\n"
-            f"💰 Твой баланс: `{balance} ₽`\n\n"
-        )
-        
+        text = f"📦 **Выбери тариф:**\n\n💰 Твой баланс: `{balance} ₽`\n\n"
         markup = InlineKeyboardMarkup(row_width=1)
-        
         for key, tariff in TARIFFS.items():
             popular = " 🔥" if tariff.get('popular') else ""
             can_afford = balance >= tariff['price_rub']
             emoji = "✅" if can_afford else "⚡"
-            
             markup.add(InlineKeyboardButton(
                 f"{emoji} {tariff['name']} — {tariff['price_rub']} ₽{popular}",
                 callback_data=f"tariff_{key}"
             ))
-        
         markup.add(InlineKeyboardButton("◀️ Назад", callback_data="start"))
-        
-        bot.edit_message_text(
-            text,
-            user_id,
-            call.message.message_id,
-            parse_mode='Markdown',
-            reply_markup=markup
-        )
-    
+        bot.edit_message_text(text, user_id, call.message.message_id, parse_mode='Markdown', reply_markup=markup)
+
     elif data.startswith("tariff_"):
         tariff_key = data.split('_')[1]
         tariff = TARIFFS.get(tariff_key)
-        
         if not tariff:
             return
-        
         balance = get_user_balance(user_id)
-        
-        # Если баланс позволяет, покупаем сразу
         if balance >= tariff['price_rub']:
             bot.answer_callback_query(call.id, "✅ Оплачено с баланса")
-            
-            # Списываем баланс
             if not deduct_user_balance(user_id, tariff['price_rub']):
                 bot.answer_callback_query(call.id, "❌ Ошибка списания", show_alert=True)
                 return
-            
             bot.edit_message_text(
                 "⏳ **Создаём VPN-ключ...**\nЭто займёт несколько секунд.",
-                user_id,
-                call.message.message_id,
-                parse_mode='Markdown'
+                user_id, call.message.message_id, parse_mode='Markdown'
             )
-            
-            # Создаём подписку
             subscription = create_vpn_subscription(user_id, tariff['days'])
-            
             if subscription:
                 text = (
                     f"✅ **VPN активирован!**\n\n"
@@ -566,59 +466,37 @@ def callback_handler(call):
                 )
                 bot.send_message(user_id, text, parse_mode='Markdown')
             else:
-                # Ошибка - возвращаем деньги
                 update_user_balance(user_id, tariff['price_rub'])
-                bot.send_message(
-                    user_id,
-                    "❌ Ошибка создания VPN. Деньги возвращены на баланс."
-                )
-            
+                bot.send_message(user_id, "❌ Ошибка создания VPN. Деньги возвращены на баланс.")
             return
-        
-        # Не хватает баланса - предлагаем пополнить
         markup = InlineKeyboardMarkup(row_width=1)
-        
-        # Кнопка пополнения звёздами (фиксированная цена)
         markup.add(InlineKeyboardButton(
             f"⭐️ Пополнить {tariff['price_stars']} Stars",
             callback_data=f"pay_stars_{tariff_key}"
         ))
-        
         if CRYPTOBOT_TOKEN:
             markup.add(InlineKeyboardButton(
                 '💲 USDT (CryptoBot)',
                 callback_data=f'pay_crypto_{tariff_key}'
             ))
-        
         markup.add(InlineKeyboardButton("◀️ Назад", callback_data="buy"))
-        
         bot.edit_message_text(
             f"📌 **Тариф:** {tariff['name']}\n"
             f"💰 **Стоимость:** {tariff['price_rub']} ₽\n"
             f"💳 **Твой баланс:** {balance} ₽\n"
             f"❌ **Не хватает:** {tariff['price_rub'] - balance} ₽\n\n"
             f"Выбери способ оплаты:",
-            user_id,
-            call.message.message_id,
-            parse_mode='Markdown',
-            reply_markup=markup
+            user_id, call.message.message_id, parse_mode='Markdown', reply_markup=markup
         )
-    
+
     elif data.startswith("pay_stars_"):
         tariff_key = data.split('_')[2]
         tariff = TARIFFS.get(tariff_key)
-        
         if not tariff:
             return
-        
         try:
             stars = tariff['price_stars']
-            
-            prices = [telebot.types.LabeledPrice(
-                label=tariff['name'],
-                amount=stars * 100  # Telegram работает в копейках звёзд
-            )]
-            
+            prices = [telebot.types.LabeledPrice(label=tariff['name'], amount=stars * 100)]
             bot.send_invoice(
                 user_id,
                 title=f'MER VPN — {tariff["name"]}',
@@ -629,22 +507,17 @@ def callback_handler(call):
                 prices=prices,
                 start_parameter='create_invoice_stars'
             )
-            
             bot.answer_callback_query(call.id, "✅ Счёт создан")
-            
         except Exception as e:
             logger.error(f"Stars payment error: {e}")
             bot.answer_callback_query(call.id, "❌ Ошибка создания счёта", show_alert=True)
-    
+
     elif data.startswith("pay_crypto_"):
         tariff_key = data.replace("pay_crypto_", "")
         tariff = TARIFFS.get(tariff_key)
-        
         if not tariff or not CRYPTOBOT_TOKEN:
             return
-        
         amount_usd = round(tariff['price_rub'] / USDT_PRICE_RUB, 2)
-        
         try:
             headers = {'Crypto-Pay-API-Token': CRYPTOBOT_TOKEN}
             payload = {
@@ -655,108 +528,53 @@ def callback_handler(call):
                 'paid_btn_name': 'openBot',
                 'paid_btn_url': 'https://t.me/your_bot'
             }
-            
-            resp = requests.post(
-                'https://pay.crypt.bot/api/createInvoice',
-                headers=headers,
-                json=payload,
-                timeout=15
-            )
-            
+            resp = requests.post('https://pay.crypt.bot/api/createInvoice', headers=headers, json=payload, timeout=15)
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get('ok'):
                     invoice = data['result']
-                    
-                    add_payment(
-                        user_id,
-                        tariff['price_rub'],
-                        'USDT',
-                        str(invoice['invoice_id']),
-                        tariff_key,
-                        'pending'
-                    )
-                    
+                    add_payment(user_id, tariff['price_rub'], 'USDT', str(invoice['invoice_id']), tariff_key, 'pending')
                     markup = InlineKeyboardMarkup()
-                    markup.add(InlineKeyboardButton(
-                        "💳 Оплатить USDT",
-                        url=invoice['pay_url']
-                    ))
-                    
+                    markup.add(InlineKeyboardButton("💳 Оплатить USDT", url=invoice['pay_url']))
                     bot.edit_message_text(
-                        f"💲 **Оплата USDT**\n\n"
-                        f"Сумма: `{amount_usd} USDT`\n"
-                        f"Тариф: {tariff['name']}\n\n"
-                        f"Нажми кнопку ниже для оплаты.",
-                        user_id,
-                        call.message.message_id,
-                        parse_mode='Markdown',
-                        reply_markup=markup
+                        f"💲 **Оплата USDT**\n\nСумма: `{amount_usd} USDT`\nТариф: {tariff['name']}\n\nНажми кнопку ниже для оплаты.",
+                        user_id, call.message.message_id, parse_mode='Markdown', reply_markup=markup
                     )
-                    
                     bot.answer_callback_query(call.id, "✅ Счёт создан")
                 else:
                     bot.answer_callback_query(call.id, "❌ Ошибка создания счёта", show_alert=True)
             else:
                 bot.answer_callback_query(call.id, "❌ Сервис временно недоступен", show_alert=True)
-                
         except Exception as e:
             logger.error(f"CryptoBot error: {e}")
             bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
-    
+
     elif data == "balance":
         balance = get_user_balance(user_id)
-        
         text = f"💰 **Твой баланс:** `{balance} ₽`"
-        
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("🛒 Купить подписку", callback_data="buy"))
         markup.add(InlineKeyboardButton("◀️ Назад", callback_data="start"))
-        
-        bot.edit_message_text(
-            text,
-            user_id,
-            call.message.message_id,
-            parse_mode='Markdown',
-            reply_markup=markup
-        )
-    
+        bot.edit_message_text(text, user_id, call.message.message_id, parse_mode='Markdown', reply_markup=markup)
+
     elif data == "my_subs":
         subs = get_user_subscriptions(user_id)
-        
         if not subs:
             text = "❌ У тебя нет активных подписок"
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("🛒 Купить подписку", callback_data="buy"))
             markup.add(InlineKeyboardButton("◀️ Назад", callback_data="start"))
-            
-            bot.edit_message_text(
-                text,
-                user_id,
-                call.message.message_id,
-                reply_markup=markup
-            )
+            bot.edit_message_text(text, user_id, call.message.message_id, reply_markup=markup)
             return
-        
         text = "📋 **Твои подписки:**\n\n"
-        
         for sub in subs:
             text += f"🌍 {SERVER_COUNTRY['name']}\n"
             text += f"📅 До: {sub['expires_at'][:10]}\n"
             text += f"🔗 [Конфиг]({sub['config_link']})\n\n"
-        
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("◀️ Назад", callback_data="start"))
-        
-        bot.edit_message_text(
-            text,
-            user_id,
-            call.message.message_id,
-            parse_mode='Markdown',
-            reply_markup=markup,
-            disable_web_page_preview=True
-        )
-    
+        bot.edit_message_text(text, user_id, call.message.message_id, parse_mode='Markdown', reply_markup=markup, disable_web_page_preview=True)
+
     elif data == "help":
         help_text = (
             "📚 **Помощь**\n\n"
@@ -765,13 +583,8 @@ def callback_handler(call):
             "3. Используй приложения v2rayNG (Android) или Streisand (iOS).\n\n"
             "❓ Вопросы: @admin"
         )
-        bot.edit_message_text(
-            help_text,
-            user_id,
-            call.message.message_id,
-            parse_mode='Markdown'
-        )
-    
+        bot.edit_message_text(help_text, user_id, call.message.message_id, parse_mode='Markdown')
+
     elif data == "start":
         cmd_start(call.message)
 
@@ -785,94 +598,51 @@ def successful_payment_handler(message):
     user_id = message.from_user.id
     payment = message.successful_payment
     payload = payment.invoice_payload
-    
     logger.info(f"💰 Успешная оплата Stars от {user_id}, payload: {payload}")
-    
     if not payload.startswith('stars_'):
         return
-    
-    # Проверяем, не был ли платёж уже обработан
     if not verify_payment(payment.telegram_payment_charge_id):
         bot.send_message(user_id, "⚠️ Этот платёж уже был обработан.")
         return
-    
     parts = payload.split('_')
     if len(parts) < 3:
         return
-    
     tariff_key = parts[1]
     tariff = TARIFFS.get(tariff_key)
-    
     if not tariff:
         return
-    
-    # Сумма в звёздах (Telegram присылает в копейках, делим на 100)
     stars_amount = payment.total_amount // 100
-    # Проверяем, что оплачено верное количество звёзд
     if stars_amount != tariff['price_stars']:
         logger.warning(f"Неверная сумма звёзд: {stars_amount} вместо {tariff['price_stars']}")
-        # Всё равно начисляем, но логируем
-    
-    rub_amount = tariff['price_rub']  # Фиксированная цена в рублях
-    
-    # Добавляем платёж в БД
-    add_payment(
-        user_id,
-        rub_amount,
-        'XTR',
-        payment.telegram_payment_charge_id,
-        tariff_key,
-        'completed'
-    )
-    
-    # Начисляем баланс (в рублях)
+    rub_amount = tariff['price_rub']
+    add_payment(user_id, rub_amount, 'XTR', payment.telegram_payment_charge_id, tariff_key, 'completed')
     update_user_balance(user_id, rub_amount)
-    
-    bot.send_message(
-        user_id,
-        f"✅ Баланс пополнен на {rub_amount} ₽\n"
-        f"Теперь ты можешь купить подписку.",
-        parse_mode='Markdown'
-    )
+    bot.send_message(user_id, f"✅ Баланс пополнен на {rub_amount} ₽\nТеперь ты можешь купить подписку.", parse_mode='Markdown')
 
 # ================ CRYPTOBOT WEBHOOK ================
 @app.route('/crypto_webhook', methods=['POST'])
 def crypto_webhook_handler():
     if not CRYPTOBOT_TOKEN:
         return 'CryptoBot not configured', 400
-    
     try:
         data = request.json
         logger.info(f"🔔 CryptoBot webhook: {data.get('event')}")
-        
         if data.get('event') == 'invoice_paid':
             invoice_id = data['payload']['invoice_id']
             payload = data['payload'].get('payload', '')
-            
-            # Проверяем уникальность платежа
             if not verify_payment(str(invoice_id)):
                 logger.info(f"Платёж {invoice_id} уже обработан")
                 return 'OK', 200
-            
             if complete_payment(str(invoice_id)):
                 parts = payload.split('_')
                 if len(parts) >= 3 and parts[0] == 'crypto':
                     tariff_key = parts[1]
                     user_id = int(parts[2])
                     tariff = TARIFFS.get(tariff_key)
-                    
                     if tariff:
                         update_user_balance(user_id, tariff['price_rub'])
-                        
-                        bot.send_message(
-                            user_id,
-                            f"✅ Баланс пополнен на {tariff['price_rub']} ₽ через USDT!\n"
-                            f"Теперь ты можешь купить подписку.",
-                            parse_mode='Markdown'
-                        )
-        
+                        bot.send_message(user_id, f"✅ Баланс пополнен на {tariff['price_rub']} ₽ через USDT!\nТеперь ты можешь купить подписку.", parse_mode='Markdown')
         return 'OK', 200
-        
     except Exception as e:
         logger.error(f"CryptoBot webhook error: {e}")
         return 'Error', 500
@@ -883,27 +653,19 @@ def crypto_webhook_handler():
 def admin_stats(message):
     conn = get_db()
     cur = conn.cursor()
-    
     cur.execute('SELECT COUNT(*) FROM users')
     users_count = cur.fetchone()[0]
-    
     cur.execute('SELECT COUNT(*) FROM users WHERE last_activity > datetime("now", "-7 days")')
     active_week = cur.fetchone()[0]
-    
     cur.execute('SELECT COUNT(*) FROM payments WHERE status="completed"')
     payments_count = cur.fetchone()[0]
-    
     cur.execute('SELECT SUM(amount) FROM payments WHERE status="completed"')
     total_revenue = cur.fetchone()[0] or 0
-    
     cur.execute('SELECT COUNT(*) FROM subscriptions WHERE status="active"')
     subs_total = cur.fetchone()[0]
-    
     cur.execute('SELECT COUNT(*) FROM subscriptions WHERE status="active" AND expires_at > datetime("now")')
     subs_active = cur.fetchone()[0]
-    
     conn.close()
-    
     stats_text = (
         f"📊 **СТАТИСТИКА БОТА**\n\n"
         f"👥 **Пользователи:**\n"
@@ -916,46 +678,30 @@ def admin_stats(message):
         f"├ Всего: {subs_total}\n"
         f"└ Активных: {subs_active}"
     )
-    
     bot.send_message(message.chat.id, stats_text, parse_mode='Markdown')
 
 @bot.message_handler(commands=['admin_broadcast'])
 @admin_only
 def admin_broadcast(message):
     text = message.text.replace('/admin_broadcast', '').strip()
-    
     if not text:
         bot.reply_to(message, "❌ Использование: /admin_broadcast Текст сообщения")
         return
-    
     conn = get_db()
     cur = conn.cursor()
     cur.execute('SELECT user_id FROM users')
     users = cur.fetchall()
     conn.close()
-    
     sent = 0
     failed = 0
-    
     bot.reply_to(message, f"📨 Начинаю рассылку {len(users)} пользователям...")
-    
     for user in users:
         try:
-            bot.send_message(
-                user['user_id'],
-                f"📢 **Рассылка от администрации**\n\n{text}",
-                parse_mode='Markdown'
-            )
+            bot.send_message(user['user_id'], f"📢 **Рассылка от администрации**\n\n{text}", parse_mode='Markdown')
             sent += 1
-        except Exception as e:
+        except:
             failed += 1
-    
-    bot.send_message(
-        message.chat.id,
-        f"✅ Рассылка завершена\n"
-        f"├ Успешно: {sent}\n"
-        f"└ Ошибок: {failed}"
-    )
+    bot.send_message(message.chat.id, f"✅ Рассылка завершена\n├ Успешно: {sent}\n└ Ошибок: {failed}")
 
 @bot.message_handler(commands=['admin_add_balance'])
 @admin_only
@@ -965,27 +711,14 @@ def admin_add_balance(message):
         if len(parts) != 3:
             bot.reply_to(message, "❌ Использование: /admin_add_balance user_id сумма")
             return
-        
         user_id = int(parts[1])
         amount = int(parts[2])
-        
         update_user_balance(user_id, amount)
-        
         bot.reply_to(message, f"✅ Баланс пользователя {user_id} пополнен на {amount} ₽")
-        
-        # Уведомляем пользователя
         try:
-            bot.send_message(
-                user_id,
-                f"💰 **Баланс пополнен**\n\n"
-                f"Сумма: +{amount} ₽\n"
-                f"Текущий баланс: {get_user_balance(user_id)} ₽\n\n"
-                f"Используй /start для обновления.",
-                parse_mode='Markdown'
-            )
-        except Exception as e:
-            logger.warning(f"Не удалось уведомить пользователя {user_id}: {e}")
-            
+            bot.send_message(user_id, f"💰 **Баланс пополнен**\n\nСумма: +{amount} ₽\nТекущий баланс: {get_user_balance(user_id)} ₽\n\nИспользуй /start для обновления.", parse_mode='Markdown')
+        except:
+            pass
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {e}")
 
