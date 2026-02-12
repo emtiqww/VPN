@@ -435,6 +435,8 @@ def callback_handler(call):
             )
             subscription = create_vpn_subscription(user_id, tariff['days'])
             if subscription:
+                logger.info(f"🚀 БЛОК ОТПРАВКИ: subscription получен, пробуем отправить...")
+                logger.info(f"📎 subscription_url = {subscription['subscription_url']}")
                 # HTML-версия (надёжнее, не ломается от спецсимволов)
                 text_html = (
                     f"✅ <b>VPN подписка активирована!</b>\n\n"
