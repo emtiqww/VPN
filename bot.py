@@ -1,9 +1,12 @@
 import os
 import requests
 from datetime import datetime
+from flask import Flask
+
+app = Flask(__name__)
 
 API_KEY = os.getenv('PROXY6_API_KEY')
-BASE_URL = 'https://proxy6.net/api'
+BASE_URL = 'https://px6.link/api'
 
 def buy_vpn(period_days=30, country='ru', version='6'):
     """
@@ -58,3 +61,7 @@ def get_balance():
     if data.get('status') == 'yes':
         return float(data['balance'])
     return 0.0
+    
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
