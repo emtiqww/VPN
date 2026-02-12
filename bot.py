@@ -4,15 +4,12 @@ import logging
 import sqlite3
 import math
 import json
-import qrcode
-from io import BytesIO
 from datetime import datetime, timedelta
 from functools import wraps
-from urllib.parse import parse_qs
 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 import requests
 
@@ -50,36 +47,39 @@ MARZBAN_PASS = os.getenv('MARZBAN_PASS', '')
 CRYPTOBOT_TOKEN = os.getenv('CRYPTOBOT_TOKEN', '')
 
 # ================ КОНСТАНТЫ ================
-STAR_PRICE_RUB = 1.65
+STAR_PRICE_RUB = 1.65  # Только для информации
 USDT_PRICE_RUB = 90
 
+# ФИКСИРОВАННЫЕ ЦЕНЫ В ЗВЁЗДАХ
 TARIFFS = {
     'month': {
         'name': '1 месяц',
-        'price': 199,
+        'price_rub': 199,
+        'price_stars': 120,
         'days': 30,
         'popular': True
     },
     'quarter': {
         'name': '3 месяца',
-        'price': 499,
+        'price_rub': 499,
+        'price_stars': 300,
         'days': 90,
         'popular': False
     },
     'year': {
         'name': '1 год',
-        'price': 1499,
+        'price_rub': 1499,
+        'price_stars': 900,
         'days': 365,
         'popular': False
     }
 }
 
-COUNTRIES = {
-    'nl': '🇳🇱 Нидерланды',
-    'de': '🇩🇪 Германия',
-    'fi': '🇫🇮 Финляндия',
-    'us': '🇺🇸 США',
-    'sg': '🇸🇬 Сингапур'
+# ТОЛЬКО ГЕРМАНИЯ (ФРАНКФУРТ)
+SERVER_COUNTRY = {
+    'code': 'de',
+    'name': '🇩🇪 Германия (Франкфурт)',
+    'flag': '🇩🇪'
 }
 
 # ================ FLASK ================
@@ -103,8 +103,7 @@ def init_db():
     conn = get_db()
     cur = conn.cursor()
     
-    # Пользователи
-    cur.execute('''
+    cur.executescript('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
@@ -113,11 +112,8 @@ def init_db():
             balance INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_activity TIMESTAMP
-        )
-    ''')
-    
-    # Платежи
-    cur.execute('''
+        );
+        
         CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -129,36 +125,24 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             completed_at TIMESTAMP,
             FOREIGN KEY(user_id) REFERENCES users(user_id)
-        )
-    ''')
-    
-    # Подписки
-    cur.execute('''
+        );
+        
         CREATE TABLE IF NOT EXISTS subscriptions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             marzban_username TEXT UNIQUE,
             config_link TEXT,
-            country TEXT DEFAULT 'nl',
+            country TEXT DEFAULT 'de',
             expires_at TIMESTAMP,
             status TEXT DEFAULT 'active',
-            auto_renew BOOLEAN DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(user_id) REFERENCES users(user_id)
-        )
-    ''')
-    
-    # Настройки
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
+        );
     ''')
     
     conn.commit()
     conn.close()
-    logger.info("База данных инициализирована")
+    logger.info("✅ База данных инициализирована")
 
 init_db()
 
@@ -194,7 +178,7 @@ class MarzbanAPI:
             logger.error(f"Marzban connection error: {e}")
             return None
     
-    def create_user(self, username, days, data_limit=0):
+    def create_user(self, username, days):
         token = self._auth()
         if not token:
             return None
@@ -204,13 +188,9 @@ class MarzbanAPI:
         
         user_data = {
             'username': username,
-            'proxies': {
-                'vless': {},
-                'trojan': {},
-                'shadowsocks': {}
-            },
+            'proxies': {'vless': {}},
             'expire': expire,
-            'data_limit': data_limit,
+            'data_limit': 0,
             'status': 'active'
         }
         
@@ -272,38 +252,10 @@ class MarzbanAPI:
         except Exception as e:
             logger.error(f"Marzban extend user error: {e}")
             return False
-    
-    def delete_user(self, username):
-        token = self._auth()
-        if not token:
-            return False
-        
-        headers = {'Authorization': f'Bearer {token}'}
-        
-        try:
-            resp = requests.delete(
-                f'{self.base_url}/api/user/{username}',
-                headers=headers,
-                timeout=10
-            )
-            return resp.status_code == 200
-        except Exception as e:
-            logger.error(f"Marzban delete user error: {e}")
-            return False
 
 marzban = MarzbanAPI(MARZBAN_URL, MARZBAN_USER, MARZBAN_PASS)
 
-# ================ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ================
-def generate_qr(data):
-    qr = qrcode.QRCode(box_size=10, border=4)
-    qr.add_data(data)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    bio = BytesIO()
-    img.save(bio, 'PNG')
-    bio.seek(0)
-    return bio
-
+# ================ ФУНКЦИИ РАБОТЫ С БАЛАНСОМ ================
 def get_user_balance(user_id):
     conn = get_db()
     cur = conn.cursor()
@@ -325,17 +277,33 @@ def update_user_balance(user_id, amount):
     conn.commit()
     conn.close()
 
+def deduct_user_balance(user_id, amount):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT balance FROM users WHERE user_id = ?', (user_id,))
+    row = cur.fetchone()
+    
+    if not row or row['balance'] < amount:
+        conn.close()
+        return False
+    
+    cur.execute('UPDATE users SET balance = balance - ? WHERE user_id = ?', (amount, user_id))
+    conn.commit()
+    conn.close()
+    return True
+
+# ================ ФУНКЦИИ ПЛАТЕЖЕЙ ================
 def add_payment(user_id, amount, currency, payment_id, tariff, status='pending'):
     conn = get_db()
     cur = conn.cursor()
     cur.execute('''
         INSERT INTO payments (user_id, amount, currency, payment_id, tariff, status)
         VALUES (?, ?, ?, ?, ?, ?)
-    ''', (user_id, amount, currency, payment_id, tariff, status))
+    ''', (user_id, amount, currency, str(payment_id), tariff, status))
     conn.commit()
-    payment_id_db = cur.lastrowid
+    payment_db_id = cur.lastrowid
     conn.close()
-    return payment_id_db
+    return payment_db_id
 
 def complete_payment(payment_id):
     conn = get_db()
@@ -350,12 +318,25 @@ def complete_payment(payment_id):
     conn.close()
     return affected > 0
 
-def create_vpn_subscription(user_id, days, country='nl'):
+def verify_payment(payment_id):
+    """Проверяет, не был ли платёж уже использован"""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT status FROM payments WHERE payment_id = ?', (str(payment_id),))
+    row = cur.fetchone()
+    conn.close()
+    
+    if row and row['status'] == 'completed':
+        return False
+    return True
+
+# ================ ФУНКЦИИ VPN ================
+def create_vpn_subscription(user_id, days):
     username = f"user_{user_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
     config_link = marzban.create_user(username, days)
     
     if not config_link:
-        return False
+        return None
     
     conn = get_db()
     cur = conn.cursor()
@@ -367,7 +348,7 @@ def create_vpn_subscription(user_id, days, country='nl'):
         user_id,
         username,
         config_link,
-        country,
+        'de',  # Всегда Германия
         (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
     ))
     
@@ -377,40 +358,9 @@ def create_vpn_subscription(user_id, days, country='nl'):
     return {
         'username': username,
         'config_link': config_link,
-        'expires_at': datetime.now() + timedelta(days=days)
+        'expires_at': datetime.now() + timedelta(days=days),
+        'country': SERVER_COUNTRY['name']
     }
-
-def extend_vpn_subscription(user_id, days):
-    conn = get_db()
-    cur = conn.cursor()
-    
-    cur.execute('''
-        SELECT * FROM subscriptions 
-        WHERE user_id = ? AND status = 'active' AND expires_at > datetime('now')
-        ORDER BY expires_at DESC LIMIT 1
-    ''', (user_id,))
-    
-    sub = cur.fetchone()
-    
-    if not sub:
-        conn.close()
-        return None
-    
-    success = marzban.extend_user(sub['marzban_username'], days)
-    
-    if success:
-        new_expire = datetime.fromisoformat(sub['expires_at']) + timedelta(days=days)
-        cur.execute('''
-            UPDATE subscriptions 
-            SET expires_at = ? 
-            WHERE id = ?
-        ''', (new_expire.strftime('%Y-%m-%d %H:%M:%S'), sub['id']))
-        conn.commit()
-        conn.close()
-        return new_expire
-    
-    conn.close()
-    return None
 
 def get_user_subscriptions(user_id):
     conn = get_db()
@@ -430,9 +380,6 @@ def setup_webhook():
         bot.remove_webhook()
         bot.set_webhook(url=WEBHOOK_URL)
         logger.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
-        
-        webhook_info = bot.get_webhook_info()
-        logger.info(f"📡 Webhook info: {webhook_info}")
     except Exception as e:
         logger.error(f"❌ Ошибка установки webhook: {e}")
 
@@ -454,40 +401,39 @@ def cmd_start(message):
     user_id = message.from_user.id
     username = message.from_user.username
     first_name = message.from_user.first_name
-    last_name = message.from_user.last_name
     
-    logger.info(f"🚀 /start от {user_id} (@{username})")
+    logger.info(f"🚀 /start от {user_id}")
     
     conn = get_db()
     cur = conn.cursor()
     cur.execute('''
-        INSERT OR IGNORE INTO users (user_id, username, first_name, last_name, last_activity)
-        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-    ''', (user_id, username, first_name, last_name))
+        INSERT OR IGNORE INTO users (user_id, username, first_name, last_activity)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+    ''', (user_id, username, first_name))
     cur.execute('''
         UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?
     ''', (user_id,))
     conn.commit()
     conn.close()
     
+    balance = get_user_balance(user_id)
+    
     welcome_text = (
         f"👋 Привет, {first_name or 'друг'}!\n\n"
-        f"🚀 **WhitePrism VPN** — быстрый и стабильный VPN\n"
-        f"🌍 Сервера в Европе и США\n"
-        f"📱 Поддержка всех устройств\n"
-        f"⚡ Скорость до 1 Гбит/с\n\n"
-        f"🔐 Протоколы: VLESS, Trojan, Shadowsocks\n\n"
-        f"👇 Выбери тариф и подключайся!"
+        f"🚀 **MER VPN** — быстрый и стабильный VPN\n"
+        f"🌍 **Сервер:** {SERVER_COUNTRY['name']}\n"
+        f"💰 **Твой баланс:** `{balance} ₽`\n\n"
+        f"👇 Выбери действие:"
     )
     
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
         InlineKeyboardButton("🛒 Купить подписку", callback_data="buy"),
-        InlineKeyboardButton("🌍 Выбрать страну", callback_data="select_country")
+        InlineKeyboardButton("💰 Баланс", callback_data="balance")
     )
     markup.add(
-        InlineKeyboardButton("📱 Как подключиться", callback_data="howto"),
-        InlineKeyboardButton("💰 Мой баланс", callback_data="balance")
+        InlineKeyboardButton("📱 Мои подписки", callback_data="my_subs"),
+        InlineKeyboardButton("ℹ️ Помощь", callback_data="help")
     )
     
     bot.send_message(
@@ -502,12 +448,9 @@ def cmd_help(message):
     help_text = (
         "📚 **Доступные команды:**\n\n"
         "/start - Главное меню\n"
-        "/buy - Купить подписку\n"
         "/balance - Проверить баланс\n"
-        "/my_subs - Мои подписки\n"
-        "/howto - Инструкция\n"
-        "/support - Поддержка\n\n"
-        "💬 Если есть вопросы — пиши @admin"
+        "/my_subs - Мои подписки\n\n"
+        "💬 По всем вопросам: @admin"
     )
     bot.send_message(message.chat.id, help_text, parse_mode='Markdown')
 
@@ -516,21 +459,12 @@ def cmd_balance(message):
     user_id = message.from_user.id
     balance = get_user_balance(user_id)
     
-    text = (
-        f"💰 **Ваш баланс**\n\n"
-        f"Текущий баланс: `{balance} ₽`\n\n"
-        f"Баланс можно пополнить при покупке подписки."
-    )
+    text = f"💰 **Твой баланс:** `{balance} ₽`"
     
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("🛒 Купить подписку", callback_data="buy"))
     
-    bot.send_message(
-        user_id,
-        text,
-        parse_mode='Markdown',
-        reply_markup=markup
-    )
+    bot.send_message(user_id, text, parse_mode='Markdown', reply_markup=markup)
 
 @bot.message_handler(commands=['my_subs'])
 def cmd_my_subs(message):
@@ -538,37 +472,20 @@ def cmd_my_subs(message):
     subs = get_user_subscriptions(user_id)
     
     if not subs:
-        text = "❌ У вас нет активных подписок"
+        text = "❌ У тебя нет активных подписок"
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("🛒 Купить подписку", callback_data="buy"))
         bot.send_message(user_id, text, reply_markup=markup)
         return
     
-    text = "📋 **Ваши активные подписки:**\n\n"
+    text = "📋 **Твои подписки:**\n\n"
     
     for sub in subs:
-        country_emoji = '🇳🇱' if sub['country'] == 'nl' else '🇩🇪' if sub['country'] == 'de' else '🇫🇮'
-        text += f"{country_emoji} **Подписка #{sub['id']}**\n"
-        text += f"📅 Действует до: `{sub['expires_at'][:10]}`\n"
+        text += f"🌍 {SERVER_COUNTRY['name']}\n"
+        text += f"📅 Действует до: {sub['expires_at'][:10]}\n"
         text += f"🔗 [Скачать конфиг]({sub['config_link']})\n\n"
     
     bot.send_message(user_id, text, parse_mode='Markdown', disable_web_page_preview=True)
-
-@bot.message_handler(commands=['howto'])
-def cmd_howto(message):
-    howto_text = (
-        "📱 **Как подключиться:**\n\n"
-        "1️⃣ Скачай приложение:\n"
-        "   • Android: [v2rayNG](https://play.google.com/store/apps/details?id=com.v2ray.ang)\n"
-        "   • iPhone: [Streisand](https://apps.apple.com/app/streisand/id6450534064)\n"
-        "   • Windows: [Nekoray](https://github.com/MatsuriDayo/nekoray/releases)\n"
-        "   • Mac: [V2RayX](https://github.com/Cenmrev/V2RayX/releases)\n\n"
-        "2️⃣ После оплаты ты получишь ссылку-конфиг\n"
-        "3️⃣ Скопируй ссылку и вставь в приложение\n"
-        "4️⃣ Нажми подключение — всё!\n\n"
-        "❓ Если нужна помощь — @admin"
-    )
-    bot.send_message(message.chat.id, howto_text, parse_mode='Markdown', disable_web_page_preview=True)
 
 # ================ CALLBACKS ================
 @bot.callback_query_handler(func=lambda call: True)
@@ -576,139 +493,108 @@ def callback_handler(call):
     user_id = call.from_user.id
     data = call.data
     
-    logger.info(f"🔄 Callback {data} от {user_id}")
+    logger.info(f"🔄 Callback: {data} от {user_id}")
     
     if data == "buy":
+        balance = get_user_balance(user_id)
+        
+        text = (
+            f"📦 **Выбери тариф:**\n\n"
+            f"💰 Твой баланс: `{balance} ₽`\n\n"
+        )
+        
         markup = InlineKeyboardMarkup(row_width=1)
         
         for key, tariff in TARIFFS.items():
-            popular = " 🔥" if tariff['popular'] else ""
+            popular = " 🔥" if tariff.get('popular') else ""
+            can_afford = balance >= tariff['price_rub']
+            emoji = "✅" if can_afford else "⚡"
+            
             markup.add(InlineKeyboardButton(
-                f"{tariff['name']} — {tariff['price']} ₽{popular}",
+                f"{emoji} {tariff['name']} — {tariff['price_rub']} ₽{popular}",
                 callback_data=f"tariff_{key}"
             ))
         
         markup.add(InlineKeyboardButton("◀️ Назад", callback_data="start"))
         
         bot.edit_message_text(
-            "📦 **Выберите тариф:**\n\n"
-            "• Все тарифы включают безлимитный трафик\n"
-            "• Поддержка всех устройств\n"
-            "• Скорость до 1 Гбит/с",
+            text,
             user_id,
             call.message.message_id,
             parse_mode='Markdown',
             reply_markup=markup
-        )
-    
-    elif data == "select_country":
-        markup = InlineKeyboardMarkup(row_width=2)
-        
-        for code, name in COUNTRIES.items():
-            markup.add(InlineKeyboardButton(
-                name,
-                callback_data=f"country_{code}"
-            ))
-        
-        markup.add(InlineKeyboardButton("◀️ Назад", callback_data="start"))
-        
-        bot.edit_message_text(
-            "🌍 **Выберите страну сервера:**\n\n"
-            "• Нидерланды — оптимальный баланс\n"
-            "• Германия — стабильный канал\n"
-            "• Финляндия — низкий пинг\n"
-            "• США — западное побережье\n"
-            "• Сингапур — Азия",
-            user_id,
-            call.message.message_id,
-            parse_mode='Markdown',
-            reply_markup=markup
-        )
-    
-    elif data.startswith("country_"):
-        country = data.replace("country_", "")
-        country_name = COUNTRIES.get(country, country)
-        
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('''
-            UPDATE users SET preferred_country = ? WHERE user_id = ?
-        ''', (country, user_id))
-        conn.commit()
-        conn.close()
-        
-        bot.answer_callback_query(
-            call.id,
-            f"✅ Страна {country_name} выбрана",
-            show_alert=False
-        )
-        
-        bot.edit_message_text(
-            f"✅ Страна {country_name} сохранена как предпочтительная.\n\n"
-            f"Теперь при покупке подписки сервер будет в {country_name}.",
-            user_id,
-            call.message.message_id
-        )
-    
-    elif data == "balance":
-        balance = get_user_balance(user_id)
-        
-        bot.edit_message_text(
-            f"💰 **Ваш баланс:** `{balance} ₽`\n\n"
-            f"Баланс можно пополнить при покупке подписки.",
-            user_id,
-            call.message.message_id,
-            parse_mode='Markdown'
-        )
-    
-    elif data == "howto":
-        howto_text = (
-            "📱 **Как подключиться:**\n\n"
-            "1️⃣ Скачай приложение:\n"
-            "   • Android: v2rayNG\n"
-            "   • iPhone: Streisand\n"
-            "   • Windows: Nekoray\n\n"
-            "2️⃣ После оплаты получи ссылку\n"
-            "3️⃣ Вставь ссылку в приложение\n"
-            "4️⃣ Подключись!"
-        )
-        
-        bot.edit_message_text(
-            howto_text,
-            user_id,
-            call.message.message_id,
-            parse_mode='Markdown'
         )
     
     elif data.startswith("tariff_"):
-        tariff_key = data.replace("tariff_", "")
+        tariff_key = data.split('_')[1]
         tariff = TARIFFS.get(tariff_key)
         
         if not tariff:
             return
         
+        balance = get_user_balance(user_id)
+        
+        # Если баланс позволяет, покупаем сразу
+        if balance >= tariff['price_rub']:
+            bot.answer_callback_query(call.id, "✅ Оплачено с баланса")
+            
+            # Списываем баланс
+            if not deduct_user_balance(user_id, tariff['price_rub']):
+                bot.answer_callback_query(call.id, "❌ Ошибка списания", show_alert=True)
+                return
+            
+            bot.edit_message_text(
+                "⏳ **Создаём VPN-ключ...**\nЭто займёт несколько секунд.",
+                user_id,
+                call.message.message_id,
+                parse_mode='Markdown'
+            )
+            
+            # Создаём подписку
+            subscription = create_vpn_subscription(user_id, tariff['days'])
+            
+            if subscription:
+                text = (
+                    f"✅ **VPN активирован!**\n\n"
+                    f"📅 Действует до: {subscription['expires_at'].strftime('%d.%m.%Y')}\n"
+                    f"🌍 Страна: {subscription['country']}\n\n"
+                    f"🔗 **Ссылка для подключения:**\n"
+                    f"`{subscription['config_link']}`"
+                )
+                bot.send_message(user_id, text, parse_mode='Markdown')
+            else:
+                # Ошибка - возвращаем деньги
+                update_user_balance(user_id, tariff['price_rub'])
+                bot.send_message(
+                    user_id,
+                    "❌ Ошибка создания VPN. Деньги возвращены на баланс."
+                )
+            
+            return
+        
+        # Не хватает баланса - предлагаем пополнить
         markup = InlineKeyboardMarkup(row_width=1)
         
-        stars_amount = math.ceil(tariff['price'] / STAR_PRICE_RUB)
+        # Кнопка пополнения звёздами (фиксированная цена)
         markup.add(InlineKeyboardButton(
-            f"⭐️ Telegram Stars ({stars_amount} ⭐️ = {tariff['price']} ₽)",
-            callback_data=f"pay_stars_{tariff_key}_{stars_amount}"
+            f"⭐️ Пополнить {tariff['price_stars']} Stars",
+            callback_data=f"pay_stars_{tariff_key}"
         ))
         
         if CRYPTOBOT_TOKEN:
             markup.add(InlineKeyboardButton(
-                "💲 USDT (CryptoBot)",
-                callback_data=f"pay_crypto_{tariff_key}"
+                '💲 USDT (CryptoBot)',
+                callback_data=f'pay_crypto_{tariff_key}'
             ))
         
         markup.add(InlineKeyboardButton("◀️ Назад", callback_data="buy"))
         
         bot.edit_message_text(
             f"📌 **Тариф:** {tariff['name']}\n"
-            f"💰 **Сумма:** {tariff['price']} ₽\n"
-            f"📆 **Период:** {tariff['days']} дней\n"
-            f"🌍 **Страна:** по умолчанию Нидерланды\n\n"
-            f"Выберите способ оплаты:",
+            f"💰 **Стоимость:** {tariff['price_rub']} ₽\n"
+            f"💳 **Твой баланс:** {balance} ₽\n"
+            f"❌ **Не хватает:** {tariff['price_rub'] - balance} ₽\n\n"
+            f"Выбери способ оплаты:",
             user_id,
             call.message.message_id,
             parse_mode='Markdown',
@@ -716,24 +602,24 @@ def callback_handler(call):
         )
     
     elif data.startswith("pay_stars_"):
-        parts = data.split('_')
-        tariff_key = parts[2]
-        stars = int(parts[3])
+        tariff_key = data.split('_')[2]
         tariff = TARIFFS.get(tariff_key)
         
         if not tariff:
             return
         
         try:
+            stars = tariff['price_stars']
+            
             prices = [telebot.types.LabeledPrice(
                 label=tariff['name'],
-                amount=stars * 100
+                amount=stars * 100  # Telegram работает в копейках звёзд
             )]
             
             bot.send_invoice(
                 user_id,
-                title=f'WhitePrism VPN — {tariff["name"]}',
-                description=f'Подписка на {tariff["days"]} дней, безлимитный трафик',
+                title=f'MER VPN — {tariff["name"]}',
+                description=f'Подписка на {tariff["days"]} дней',
                 invoice_payload=f'stars_{tariff_key}_{user_id}',
                 provider_token='',
                 currency='XTR',
@@ -754,7 +640,7 @@ def callback_handler(call):
         if not tariff or not CRYPTOBOT_TOKEN:
             return
         
-        amount_usd = round(tariff['price'] / USDT_PRICE_RUB, 2)
+        amount_usd = round(tariff['price_rub'] / USDT_PRICE_RUB, 2)
         
         try:
             headers = {'Crypto-Pay-API-Token': CRYPTOBOT_TOKEN}
@@ -779,9 +665,9 @@ def callback_handler(call):
                 if data.get('ok'):
                     invoice = data['result']
                     
-                    payment_id = add_payment(
+                    add_payment(
                         user_id,
-                        tariff['price'],
+                        tariff['price_rub'],
                         'USDT',
                         str(invoice['invoice_id']),
                         tariff_key,
@@ -798,7 +684,7 @@ def callback_handler(call):
                         f"💲 **Оплата USDT**\n\n"
                         f"Сумма: `{amount_usd} USDT`\n"
                         f"Тариф: {tariff['name']}\n\n"
-                        f"Нажмите кнопку ниже для оплаты.",
+                        f"Нажми кнопку ниже для оплаты.",
                         user_id,
                         call.message.message_id,
                         parse_mode='Markdown',
@@ -815,6 +701,74 @@ def callback_handler(call):
             logger.error(f"CryptoBot error: {e}")
             bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
     
+    elif data == "balance":
+        balance = get_user_balance(user_id)
+        
+        text = f"💰 **Твой баланс:** `{balance} ₽`"
+        
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🛒 Купить подписку", callback_data="buy"))
+        markup.add(InlineKeyboardButton("◀️ Назад", callback_data="start"))
+        
+        bot.edit_message_text(
+            text,
+            user_id,
+            call.message.message_id,
+            parse_mode='Markdown',
+            reply_markup=markup
+        )
+    
+    elif data == "my_subs":
+        subs = get_user_subscriptions(user_id)
+        
+        if not subs:
+            text = "❌ У тебя нет активных подписок"
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🛒 Купить подписку", callback_data="buy"))
+            markup.add(InlineKeyboardButton("◀️ Назад", callback_data="start"))
+            
+            bot.edit_message_text(
+                text,
+                user_id,
+                call.message.message_id,
+                reply_markup=markup
+            )
+            return
+        
+        text = "📋 **Твои подписки:**\n\n"
+        
+        for sub in subs:
+            text += f"🌍 {SERVER_COUNTRY['name']}\n"
+            text += f"📅 До: {sub['expires_at'][:10]}\n"
+            text += f"🔗 [Конфиг]({sub['config_link']})\n\n"
+        
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("◀️ Назад", callback_data="start"))
+        
+        bot.edit_message_text(
+            text,
+            user_id,
+            call.message.message_id,
+            parse_mode='Markdown',
+            reply_markup=markup,
+            disable_web_page_preview=True
+        )
+    
+    elif data == "help":
+        help_text = (
+            "📚 **Помощь**\n\n"
+            "1. Пополни баланс или оплати тариф звёздами/USDT.\n"
+            "2. После оплаты VPN-ключ придёт автоматически.\n"
+            "3. Используй приложения v2rayNG (Android) или Streisand (iOS).\n\n"
+            "❓ Вопросы: @admin"
+        )
+        bot.edit_message_text(
+            help_text,
+            user_id,
+            call.message.message_id,
+            parse_mode='Markdown'
+        )
+    
     elif data == "start":
         cmd_start(call.message)
 
@@ -829,76 +783,54 @@ def successful_payment_handler(message):
     payment = message.successful_payment
     payload = payment.invoice_payload
     
-    logger.info(f"💰 Успешная оплата от {user_id}: {payload}")
+    logger.info(f"💰 Успешная оплата Stars от {user_id}, payload: {payload}")
     
-    if payload.startswith('stars_'):
-        parts = payload.split('_')
-        tariff_key = parts[1]
-        tariff = TARIFFS.get(tariff_key)
-        
-        if not tariff:
-            return
-        
-        amount_stars = payment.total_amount // 100
-        rub_amount = int(amount_stars * STAR_PRICE_RUB)
-        
-        payment_id = add_payment(
-            user_id,
-            rub_amount,
-            'XTR',
-            payment.telegram_payment_charge_id,
-            tariff_key,
-            'completed'
-        )
-        
-        update_user_balance(user_id, rub_amount)
-        
-        bot.send_message(
-            user_id,
-            "⏳ **Создаём ваш VPN-ключ...**\nЭто займёт несколько секунд.",
-            parse_mode='Markdown'
-        )
-        
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT preferred_country FROM users WHERE user_id = ?', (user_id,))
-        row = cur.fetchone()
-        country = row['preferred_country'] if row and row['preferred_country'] else 'nl'
-        conn.close()
-        
-        subscription = create_vpn_subscription(user_id, tariff['days'], country)
-        
-        if subscription:
-            qr_bio = generate_qr(subscription['config_link'])
-            
-            success_text = (
-                f"✅ **VPN-доступ активирован!**\n\n"
-                f"📅 Действует до: {subscription['expires_at'].strftime('%d.%m.%Y')}\n"
-                f"🌍 Страна: {COUNTRIES.get(country, country)}\n"
-                f"📊 Трафик: безлимит\n\n"
-                f"🔗 **Ссылка для подключения:**\n"
-                f"`{subscription['config_link']}`\n\n"
-                f"📱 **Инструкция:**\n"
-                f"1. Скопируйте ссылку\n"
-                f"2. Вставьте в приложение v2rayNG/Streisand\n"
-                f"3. Подключитесь"
-            )
-            
-            bot.send_photo(
-                user_id,
-                qr_bio,
-                caption=success_text,
-                parse_mode='Markdown'
-            )
-        else:
-            bot.send_message(
-                user_id,
-                "❌ **Ошибка при создании VPN-ключа.**\n"
-                "Администратор уже уведомлён. Мы вернём деньги в ближайшее время.",
-                parse_mode='Markdown'
-            )
-            
-            logger.error(f"Failed to create VPN for user {user_id}")
+    if not payload.startswith('stars_'):
+        return
+    
+    # Проверяем, не был ли платёж уже обработан
+    if not verify_payment(payment.telegram_payment_charge_id):
+        bot.send_message(user_id, "⚠️ Этот платёж уже был обработан.")
+        return
+    
+    parts = payload.split('_')
+    if len(parts) < 3:
+        return
+    
+    tariff_key = parts[1]
+    tariff = TARIFFS.get(tariff_key)
+    
+    if not tariff:
+        return
+    
+    # Сумма в звёздах (Telegram присылает в копейках, делим на 100)
+    stars_amount = payment.total_amount // 100
+    # Проверяем, что оплачено верное количество звёзд
+    if stars_amount != tariff['price_stars']:
+        logger.warning(f"Неверная сумма звёзд: {stars_amount} вместо {tariff['price_stars']}")
+        # Всё равно начисляем, но логируем
+    
+    rub_amount = tariff['price_rub']  # Фиксированная цена в рублях
+    
+    # Добавляем платёж в БД
+    add_payment(
+        user_id,
+        rub_amount,
+        'XTR',
+        payment.telegram_payment_charge_id,
+        tariff_key,
+        'completed'
+    )
+    
+    # Начисляем баланс (в рублях)
+    update_user_balance(user_id, rub_amount)
+    
+    bot.send_message(
+        user_id,
+        f"✅ Баланс пополнен на {rub_amount} ₽\n"
+        f"Теперь ты можешь купить подписку.",
+        parse_mode='Markdown'
+    )
 
 # ================ CRYPTOBOT WEBHOOK ================
 @app.route('/crypto_webhook', methods=['POST'])
@@ -914,6 +846,11 @@ def crypto_webhook_handler():
             invoice_id = data['payload']['invoice_id']
             payload = data['payload'].get('payload', '')
             
+            # Проверяем уникальность платежа
+            if not verify_payment(str(invoice_id)):
+                logger.info(f"Платёж {invoice_id} уже обработан")
+                return 'OK', 200
+            
             if complete_payment(str(invoice_id)):
                 parts = payload.split('_')
                 if len(parts) >= 3 and parts[0] == 'crypto':
@@ -922,40 +859,14 @@ def crypto_webhook_handler():
                     tariff = TARIFFS.get(tariff_key)
                     
                     if tariff:
-                        update_user_balance(user_id, tariff['price'])
+                        update_user_balance(user_id, tariff['price_rub'])
                         
                         bot.send_message(
                             user_id,
-                            "✅ **Оплата получена!**\n\n"
-                            "⏳ Создаём ваш VPN-ключ...",
+                            f"✅ Баланс пополнен на {tariff['price_rub']} ₽ через USDT!\n"
+                            f"Теперь ты можешь купить подписку.",
                             parse_mode='Markdown'
                         )
-                        
-                        conn = get_db()
-                        cur = conn.cursor()
-                        cur.execute('SELECT preferred_country FROM users WHERE user_id = ?', (user_id,))
-                        row = cur.fetchone()
-                        country = row['preferred_country'] if row and row['preferred_country'] else 'nl'
-                        conn.close()
-                        
-                        subscription = create_vpn_subscription(user_id, tariff['days'], country)
-                        
-                        if subscription:
-                            qr_bio = generate_qr(subscription['config_link'])
-                            
-                            success_text = (
-                                f"✅ **VPN-доступ активирован!**\n\n"
-                                f"📅 Действует до: {subscription['expires_at'].strftime('%d.%m.%Y')}\n"
-                                f"🌍 Страна: {COUNTRIES.get(country, country)}\n"
-                                f"🔗 `{subscription['config_link']}`"
-                            )
-                            
-                            bot.send_photo(
-                                user_id,
-                                qr_bio,
-                                caption=success_text,
-                                parse_mode='Markdown'
-                            )
         
         return 'OK', 200
         
@@ -988,9 +899,6 @@ def admin_stats(message):
     cur.execute('SELECT COUNT(*) FROM subscriptions WHERE status="active" AND expires_at > datetime("now")')
     subs_active = cur.fetchone()[0]
     
-    cur.execute('SELECT COUNT(*) FROM payments WHERE status="pending"')
-    pending_payments = cur.fetchone()[0]
-    
     conn.close()
     
     stats_text = (
@@ -1000,8 +908,7 @@ def admin_stats(message):
         f"└ Активные (7д): {active_week}\n\n"
         f"💰 **Финансы:**\n"
         f"├ Выручка: {total_revenue} ₽\n"
-        f"├ Всего платежей: {payments_count}\n"
-        f"└ Ожидают: {pending_payments}\n\n"
+        f"└ Всего платежей: {payments_count}\n\n"
         f"🔐 **Подписки:**\n"
         f"├ Всего: {subs_total}\n"
         f"└ Активных: {subs_active}"
@@ -1063,16 +970,18 @@ def admin_add_balance(message):
         
         bot.reply_to(message, f"✅ Баланс пользователя {user_id} пополнен на {amount} ₽")
         
+        # Уведомляем пользователя
         try:
             bot.send_message(
                 user_id,
                 f"💰 **Баланс пополнен**\n\n"
                 f"Сумма: +{amount} ₽\n"
-                f"Текущий баланс: {get_user_balance(user_id)} ₽",
+                f"Текущий баланс: {get_user_balance(user_id)} ₽\n\n"
+                f"Используй /start для обновления.",
                 parse_mode='Markdown'
             )
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить пользователя {user_id}: {e}")
             
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {e}")
@@ -1091,7 +1000,7 @@ def webhook_handler():
 
 @app.route('/')
 def index():
-    return 'WhitePrism VPN Bot is running!'
+    return 'MER VPN Bot is running!'
 
 @app.route('/health')
 def health():
@@ -1099,4 +1008,5 @@ def health():
 
 # ================ ЗАПУСК ================
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8444)
+    port = int(os.environ.get('PORT', 8444))
+    app.run(host='0.0.0.0', port=port)
