@@ -13,7 +13,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 import requests
 
-# ================ НАСТРОЙКА ЛОГИРОВАНИЯ ================
+# ================ НАСТРОЙКА ЛОГИРОВАНИЯ ===========
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
