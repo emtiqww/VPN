@@ -162,7 +162,7 @@ class MarzbanAPI:
         try:
             resp = requests.post(
                 f'{self.base_url}/api/admin/token',
-                json={'username': self.username, 'password': self.password},
+                data={'username': self.username, 'password': self.password},
                 timeout=10
             )
             
