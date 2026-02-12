@@ -189,6 +189,9 @@ class MarzbanAPI:
         user_data = {
             'username': username,
             'proxies': {'vless': {}},
+            'inbounds': {
+                'vless': ['VLESS TCP']   # ⚠️ ЗАМЕНИ НА СВОЙ TAG ИЗ ПУНКТА 2
+            },
             'expire': expire,
             'data_limit': 0,
             'status': 'active'
