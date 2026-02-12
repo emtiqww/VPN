@@ -228,11 +228,13 @@ def create_vpn_for_user(user_id, days):
         conn.close()
     return False
 
-# ========== КОМАНДЫ TELEGRAM ==========
 @bot.message_handler(commands=['start'])
 def start(message):
     user_id = message.from_user.id
     username = message.from_user.username
+    
+    # 👇👇👇 ВОТ ЭТА СТРОЧКА РЕШАЕТ ВСЁ 👇👇👇
+    print(f"🔥🔥🔥 /start от {user_id} (@{username})")
     
     conn = get_db()
     cur = conn.cursor()
@@ -244,9 +246,9 @@ def start(message):
     markup.add(InlineKeyboardButton('🛒 Купить подписку', callback_data='buy'))
     bot.send_message(
         user_id,
-        '👋 Добро пожаловать в WhitePrism VPN!\n\n'
-        '🚀 Быстрый и стабильный VPN на базе VLESS\n'
-        '🌍 Сервера в Нидерландах\n'
+        '👋 Добро пожаловать в MER VPN!\n\n'
+        '🚀 Быстрый и стабильный VPN\n'
+        '🌍 Сервера в Германии\n'
         '📱 Поддержка всех устройств\n\n'
         '👇 Нажми кнопку ниже, чтобы выбрать тариф',
         reply_markup=markup
