@@ -230,29 +230,8 @@ def create_vpn_for_user(user_id, days):
 
 @bot.message_handler(commands=['start'])
 def start(message):
-    user_id = message.from_user.id
-    username = message.from_user.username
-    
-    # 👇👇👇 ВОТ ЭТА СТРОЧКА РЕШАЕТ ВСЁ 👇👇👇
-    print(f"🔥🔥🔥 /start от {user_id} (@{username})")
-    
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute('INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)', (user_id, username))
-    conn.commit()
-    conn.close()
-    
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton('🛒 Купить подписку', callback_data='buy'))
-    bot.send_message(
-        user_id,
-        '👋 Добро пожаловать в MER VPN!\n\n'
-        '🚀 Быстрый и стабильный VPN\n'
-        '🌍 Сервера в Германии\n'
-        '📱 Поддержка всех устройств\n\n'
-        '👇 Нажми кнопку ниже, чтобы выбрать тариф',
-        reply_markup=markup
-    )
+    print(f"🔥🔥🔥 /start от {message.from_user.id}")
+    bot.send_message(message.chat.id, "✅ Бот работает!")
 
 @bot.callback_query_handler(func=lambda call: call.data == 'buy')
 def buy_callback(call):
