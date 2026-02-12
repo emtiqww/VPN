@@ -47,29 +47,28 @@ MARZBAN_PASS = os.getenv('MARZBAN_PASS', '')
 CRYPTOBOT_TOKEN = os.getenv('CRYPTOBOT_TOKEN', '')
 
 # ================ КОНСТАНТЫ ================
-STAR_PRICE_RUB = 1.65
-USDT_PRICE_RUB = 90
+USDT_PRICE_RUB = 90  # фиксированный курс для CryptoBot
 
-# ФИКСИРОВАННЫЕ ЦЕНЫ В ЗВЁЗДАХ
+# ФИКСИРОВАННЫЕ ЦЕНЫ В ЗВЁЗДАХ (БЕЗ РАСЧЁТОВ)
 TARIFFS = {
     'month': {
         'name': '1 месяц',
         'price_rub': 199,
-        'price_stars': 120,
+        'price_stars': 120,   # ✅ ровно 120
         'days': 30,
         'popular': True
     },
     'quarter': {
         'name': '3 месяца',
         'price_rub': 499,
-        'price_stars': 300,
+        'price_stars': 300,   # ✅ ровно 300
         'days': 90,
         'popular': False
     },
     'year': {
         'name': '1 год',
         'price_rub': 1499,
-        'price_stars': 900,
+        'price_stars': 900,   # ✅ ровно 900
         'days': 365,
         'popular': False
     }
@@ -82,9 +81,8 @@ SERVER_COUNTRY = {
     'flag': '🇩🇪'
 }
 
-# ⚠️ ВАЖНО: УКАЖИ ТОЧНЫЙ ТЭГ ТВОЕГО VLESS INBOUND ИЗ XRAY_CONFIG.JSON
-# Посмотреть: grep -o '"tag": "[^"]*"' /var/lib/marzban/xray_config.json | grep VLESS
-VLESS_INBOUND_TAG = "VLESS TCP"   # <--- ЗАМЕНИ НА СВОЙ, ЕСЛИ ОТЛИЧАЕТСЯ
+# ⚠️ ТЭГ ТВОЕГО VLESS INBOUND (посмотри в xray_config.json)
+VLESS_INBOUND_TAG = "VLESS TCP"
 
 # ================ FLASK ================
 app = Flask(__name__)
@@ -95,9 +93,9 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # ================ БАЗА ДАННЫХ ================
 def get_db():
     if os.environ.get('RENDER'):
-        db_path = '/tmp/whiteprism.db'
+        db_path = '/tmp/mer.db'
     else:
-        db_path = 'whiteprism.db'
+        db_path = 'mer.db'
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
@@ -158,7 +156,6 @@ class MarzbanAPI:
         if self.token and self.token_expiry and datetime.now() < self.token_expiry:
             return self.token
         try:
-            # ВАЖНО: form-data, не json!
             resp = requests.post(
                 f'{self.base_url}/api/admin/token',
                 data={'username': self.username, 'password': self.password},
@@ -176,22 +173,31 @@ class MarzbanAPI:
             logger.error(f"Marzban connection error: {e}")
             return None
 
-    def create_user(self, username, days):
+    def create_user(self, user_id, days):
         token = self._auth()
         if not token:
+            logger.error("❌ Не удалось получить токен Marzban")
             return None
+
         headers = {'Authorization': f'Bearer {token}'}
         expire = int((datetime.now() + timedelta(days=days)).timestamp())
+        
+        # ✅ Имя пользователя = только user_id (без timestamp)
+        username = f"user_{user_id}"
+
         user_data = {
             'username': username,
             'proxies': {'vless': {}},
             'inbounds': {
-                'vless': [VLESS_INBOUND_TAG]   # <-- ТЭГ ИЗ ПЕРЕМЕННОЙ
+                'vless': [VLESS_INBOUND_TAG]
             },
             'expire': expire,
             'data_limit': 0,
             'status': 'active'
         }
+
+        logger.info(f"📤 Отправка запроса в Marzban: {json.dumps(user_data, indent=2)}")
+        
         try:
             resp = requests.post(
                 f'{self.base_url}/api/user',
@@ -199,20 +205,31 @@ class MarzbanAPI:
                 json=user_data,
                 timeout=10
             )
+            
             logger.info(f"📦 Marzban create user status: {resp.status_code}")
-            logger.info(f"📦 Marzban create user response: {resp.text}")
+            logger.info(f"📦 Marzban create user response: {resp.text[:500]}")
+            
             if resp.status_code == 200:
-                config_resp = requests.get(
-                    f'{self.base_url}/api/user/{username}/config',
-                    headers=headers,
-                    timeout=10
-                )
-                if config_resp.status_code == 200:
-                    return config_resp.json().get('link', '')
-            return None
+                data = resp.json()
+                links = data.get('links', [])
+                if links:
+                    logger.info(f"✅ Получена ссылка: {links[0]}")
+                    return username, links[0]  # возвращаем имя и ссылку
+                else:
+                    logger.error("❌ В ответе нет links")
+                    return None, None
+            else:
+                logger.error(f"❌ Ошибка Marzban: {resp.status_code} - {resp.text}")
+                return None, None
+        except requests.exceptions.Timeout:
+            logger.error("❌ Таймаут при запросе к Marzban (10 сек)")
+            return None, None
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"❌ Ошибка подключения к Marzban: {e}")
+            return None, None
         except Exception as e:
-            logger.error(f"Marzban create user error: {e}")
-            return None
+            logger.error(f"❌ Неизвестная ошибка: {e}")
+            return None, None
 
 marzban = MarzbanAPI(MARZBAN_URL, MARZBAN_USER, MARZBAN_PASS)
 
@@ -287,11 +304,11 @@ def verify_payment(payment_id):
 
 # ================ ФУНКЦИИ VPN ================
 def create_vpn_subscription(user_id, days):
-    username = f"user_{user_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    config_link = marzban.create_user(username, days)
+    marzban_username, config_link = marzban.create_user(user_id, days)
     if not config_link:
         logger.error(f"❌ Не удалось создать VPN для user {user_id}")
         return None
+    
     conn = get_db()
     cur = conn.cursor()
     cur.execute('''
@@ -299,15 +316,16 @@ def create_vpn_subscription(user_id, days):
         VALUES (?, ?, ?, ?, ?)
     ''', (
         user_id,
-        username,
+        marzban_username,
         config_link,
         'de',
         (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
     ))
     conn.commit()
     conn.close()
+    
     return {
-        'username': username,
+        'username': marzban_username,
         'config_link': config_link,
         'expires_at': datetime.now() + timedelta(days=days),
         'country': SERVER_COUNTRY['name']
@@ -353,6 +371,7 @@ def cmd_start(message):
     username = message.from_user.username
     first_name = message.from_user.first_name
     logger.info(f"🚀 /start от {user_id}")
+    
     conn = get_db()
     cur = conn.cursor()
     cur.execute('''
@@ -362,7 +381,9 @@ def cmd_start(message):
     cur.execute('UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?', (user_id,))
     conn.commit()
     conn.close()
+    
     balance = get_user_balance(user_id)
+    
     welcome_text = (
         f"👋 Привет, {first_name or 'друг'}!\n\n"
         f"🚀 **MER VPN** — быстрый и стабильный VPN\n"
@@ -370,6 +391,7 @@ def cmd_start(message):
         f"💰 **Твой баланс:** `{balance} ₽`\n\n"
         f"👇 Выбери действие:"
     )
+    
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
         InlineKeyboardButton("🛒 Купить подписку", callback_data="buy"),
@@ -379,6 +401,7 @@ def cmd_start(message):
         InlineKeyboardButton("📱 Мои подписки", callback_data="my_subs"),
         InlineKeyboardButton("ℹ️ Помощь", callback_data="help")
     )
+    
     bot.send_message(user_id, welcome_text, parse_mode='Markdown', reply_markup=markup)
 
 @bot.message_handler(commands=['help'])
@@ -446,6 +469,8 @@ def callback_handler(call):
         if not tariff:
             return
         balance = get_user_balance(user_id)
+        
+        # Проверка баланса
         if balance >= tariff['price_rub']:
             bot.answer_callback_query(call.id, "✅ Оплачено с баланса")
             if not deduct_user_balance(user_id, tariff['price_rub']):
@@ -466,12 +491,15 @@ def callback_handler(call):
                 )
                 bot.send_message(user_id, text, parse_mode='Markdown')
             else:
+                # Ошибка создания VPN — возвращаем деньги
                 update_user_balance(user_id, tariff['price_rub'])
                 bot.send_message(user_id, "❌ Ошибка создания VPN. Деньги возвращены на баланс.")
             return
+        
+        # Не хватает баланса — показываем варианты оплаты
         markup = InlineKeyboardMarkup(row_width=1)
         markup.add(InlineKeyboardButton(
-            f"⭐️ Пополнить {tariff['price_stars']} Stars",
+            f"⭐️ Пополнить {tariff['price_stars']} Stars",  # ✅ фиксированная цена
             callback_data=f"pay_stars_{tariff_key}"
         ))
         if CRYPTOBOT_TOKEN:
@@ -480,6 +508,7 @@ def callback_handler(call):
                 callback_data=f'pay_crypto_{tariff_key}'
             ))
         markup.add(InlineKeyboardButton("◀️ Назад", callback_data="buy"))
+        
         bot.edit_message_text(
             f"📌 **Тариф:** {tariff['name']}\n"
             f"💰 **Стоимость:** {tariff['price_rub']} ₽\n"
@@ -495,11 +524,11 @@ def callback_handler(call):
         if not tariff:
             return
         try:
-            stars = tariff['price_stars']
+            stars = tariff['price_stars']  # ✅ берём фиксированное значение
             prices = [telebot.types.LabeledPrice(label=tariff['name'], amount=stars * 100)]
             bot.send_invoice(
                 user_id,
-                title=f'MER VPN — {tariff["name"]}',
+                title=f'MER VPN — {tariff["name"]}',  # ✅ название MER
                 description=f'Подписка на {tariff["days"]} дней',
                 invoice_payload=f'stars_{tariff_key}_{user_id}',
                 provider_token='',
@@ -599,25 +628,38 @@ def successful_payment_handler(message):
     payment = message.successful_payment
     payload = payment.invoice_payload
     logger.info(f"💰 Успешная оплата Stars от {user_id}, payload: {payload}")
+    
     if not payload.startswith('stars_'):
         return
+    
     if not verify_payment(payment.telegram_payment_charge_id):
         bot.send_message(user_id, "⚠️ Этот платёж уже был обработан.")
         return
+    
     parts = payload.split('_')
     if len(parts) < 3:
         return
+    
     tariff_key = parts[1]
     tariff = TARIFFS.get(tariff_key)
     if not tariff:
         return
+    
     stars_amount = payment.total_amount // 100
+    # Проверяем, что оплачено верное количество звёзд
     if stars_amount != tariff['price_stars']:
-        logger.warning(f"Неверная сумма звёзд: {stars_amount} вместо {tariff['price_stars']}")
+        logger.warning(f"⚠️ Неверная сумма звёзд: {stars_amount} вместо {tariff['price_stars']}")
+        # Всё равно начисляем, но логируем
+    
     rub_amount = tariff['price_rub']
     add_payment(user_id, rub_amount, 'XTR', payment.telegram_payment_charge_id, tariff_key, 'completed')
     update_user_balance(user_id, rub_amount)
-    bot.send_message(user_id, f"✅ Баланс пополнен на {rub_amount} ₽\nТеперь ты можешь купить подписку.", parse_mode='Markdown')
+    
+    bot.send_message(
+        user_id,
+        f"✅ Баланс пополнен на {rub_amount} ₽\nТеперь ты можешь купить подписку.",
+        parse_mode='Markdown'
+    )
 
 # ================ CRYPTOBOT WEBHOOK ================
 @app.route('/crypto_webhook', methods=['POST'])
@@ -630,9 +672,11 @@ def crypto_webhook_handler():
         if data.get('event') == 'invoice_paid':
             invoice_id = data['payload']['invoice_id']
             payload = data['payload'].get('payload', '')
+            
             if not verify_payment(str(invoice_id)):
                 logger.info(f"Платёж {invoice_id} уже обработан")
                 return 'OK', 200
+            
             if complete_payment(str(invoice_id)):
                 parts = payload.split('_')
                 if len(parts) >= 3 and parts[0] == 'crypto':
@@ -641,7 +685,11 @@ def crypto_webhook_handler():
                     tariff = TARIFFS.get(tariff_key)
                     if tariff:
                         update_user_balance(user_id, tariff['price_rub'])
-                        bot.send_message(user_id, f"✅ Баланс пополнен на {tariff['price_rub']} ₽ через USDT!\nТеперь ты можешь купить подписку.", parse_mode='Markdown')
+                        bot.send_message(
+                            user_id,
+                            f"✅ Баланс пополнен на {tariff['price_rub']} ₽ через USDT!\nТеперь ты можешь купить подписку.",
+                            parse_mode='Markdown'
+                        )
         return 'OK', 200
     except Exception as e:
         logger.error(f"CryptoBot webhook error: {e}")
@@ -666,8 +714,9 @@ def admin_stats(message):
     cur.execute('SELECT COUNT(*) FROM subscriptions WHERE status="active" AND expires_at > datetime("now")')
     subs_active = cur.fetchone()[0]
     conn.close()
+    
     stats_text = (
-        f"📊 **СТАТИСТИКА БОТА**\n\n"
+        f"📊 **СТАТИСТИКА MER VPN**\n\n"
         f"👥 **Пользователи:**\n"
         f"├ Всего: {users_count}\n"
         f"└ Активные (7д): {active_week}\n\n"
@@ -716,7 +765,11 @@ def admin_add_balance(message):
         update_user_balance(user_id, amount)
         bot.reply_to(message, f"✅ Баланс пользователя {user_id} пополнен на {amount} ₽")
         try:
-            bot.send_message(user_id, f"💰 **Баланс пополнен**\n\nСумма: +{amount} ₽\nТекущий баланс: {get_user_balance(user_id)} ₽\n\nИспользуй /start для обновления.", parse_mode='Markdown')
+            bot.send_message(
+                user_id,
+                f"💰 **Баланс пополнен**\n\nСумма: +{amount} ₽\nТекущий баланс: {get_user_balance(user_id)} ₽\n\nИспользуй /start для обновления.",
+                parse_mode='Markdown'
+            )
         except:
             pass
     except Exception as e:
